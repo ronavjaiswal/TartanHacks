@@ -2,12 +2,13 @@
 breath_feedback_pipeline.py
 
 Ultra-stable breath coaching pipeline.
-NO Torch. NO Whisper. NO WhisperX. NO pyannote.
+NO transcription.
+NO ML.
+NO Torch.
+NO Whisper.
+NO Vosk.
 
-Uses:
-- ffmpeg (audio extraction)
-- Vosk (CPU-only word timestamps)
-
+Pure timing-based coaching.
 Safe for FastAPI / Uvicorn / Gunicorn.
 """
 
@@ -19,21 +20,11 @@ import uuid
 import subprocess
 from typing import Dict, Any, List, Optional
 
-# ==============================
-# Configuration
-# ==============================
-
-VOSK_MODEL_PATH = os.environ.get(
-    "VOSK_MODEL_PATH",
-    "models/vosk-model-small-en-us-0.15"
-)
-
-# ==============================
-# ffmpeg helpers (ROBUST)
-# ==============================
+# ============================================================
+# ffmpeg utilities (robust + race-safe)
+# ============================================================
 
 def _wait_for_file_ready(path: str, timeout: float = 3.0):
-    """Avoid race conditions on uploaded files."""
     end = time.time() + timeout
     last = -1
     while time.time() < end:
@@ -90,9 +81,9 @@ def pick_audio(input_media: str, out_dir: str, sr: int) -> str:
         else input_media
     )
 
-# ==============================
+# ============================================================
 # Breath + bad region parsing
-# ==============================
+# ============================================================
 
 def extract_breath_starts(breath_dict: Dict[str, Any]) -> List[float]:
     return sorted(
@@ -109,52 +100,15 @@ def extract_bad_regions(bad_dict: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "label": label,
                 "start": float(r["start_s"]),
                 "end": float(r["end_s"]),
+                "duration": float(r.get("duration_s", r["end_s"] - r["start_s"])),
                 "peak": float(r["peak"]),
                 "note": r.get("note", ""),
             })
     return sorted(regions, key=lambda x: x["start"])
 
-# ==============================
-# Vosk transcription (LIGHT)
-# ==============================
-
-def transcribe_words_vosk(audio_path: str) -> List[Dict[str, float]]:
-    """
-    CPU-only word timestamps via Vosk.
-    """
-    import soundfile as sf
-    from vosk import Model, KaldiRecognizer
-
-    if not os.path.exists(VOSK_MODEL_PATH):
-        raise RuntimeError(f"Vosk model missing at {VOSK_MODEL_PATH}")
-
-    model = Model(VOSK_MODEL_PATH)
-
-    data, sr = sf.read(audio_path)
-    if sr != 16000:
-        raise RuntimeError("Audio must be 16kHz mono for Vosk")
-
-    rec = KaldiRecognizer(model, sr)
-    rec.SetWords(True)
-
-    words = []
-    step = 4000
-    for i in range(0, len(data), step):
-        rec.AcceptWaveform(data[i:i + step].tobytes())
-
-    res = json.loads(rec.FinalResult())
-    for w in res.get("result", []):
-        words.append({
-            "word": w["word"],
-            "start": float(w["start"]),
-            "end": float(w["end"]),
-        })
-
-    return words
-
-# ==============================
-# Alignment helpers
-# ==============================
+# ============================================================
+# Timing helpers
+# ============================================================
 
 def nearest_before(ts: List[float], t: float) -> Optional[float]:
     c = [x for x in ts if x <= t]
@@ -164,17 +118,9 @@ def nearest_after(ts: List[float], t: float) -> Optional[float]:
     c = [x for x in ts if x > t]
     return min(c) if c else None
 
-def nearest_word(words, t: float, before=True):
-    if before:
-        c = [w for w in words if w["start"] <= t]
-        return max(c, key=lambda x: x["start"]) if c else None
-    else:
-        c = [w for w in words if w["start"] > t]
-        return min(c, key=lambda x: x["start"]) if c else None
-
-# ==============================
+# ============================================================
 # MAIN ENTRY POINT
-# ==============================
+# ============================================================
 
 def analyze_breaths_and_bad_regions(
     input_media_path: str,
@@ -182,11 +128,10 @@ def analyze_breaths_and_bad_regions(
     bad_dict: Dict[str, Any],
     out_dir: str = "out_breathcoach",
     sample_rate: int = 16000,
-    transcribe: bool = True,
 ) -> Dict[str, Any]:
     """
-    Main pipeline function.
-    Safe to call inside FastAPI.
+    Main breath coaching analysis.
+    NO transcription.
     """
 
     audio_path = pick_audio(input_media_path, out_dir, sample_rate)
@@ -194,52 +139,56 @@ def analyze_breaths_and_bad_regions(
     breaths = extract_breath_starts(breaths_dict)
     bad_regions = extract_bad_regions(bad_dict)
 
-    words = transcribe_words_vosk(audio_path) if transcribe else []
-
     assignments = []
-    for r in bad_regions:
-        b = nearest_before(breaths, r["start"])
-        relation = "before"
-        if b is None:
-            b = nearest_after(breaths, r["start"])
-            relation = "after"
+    coaching_lines = []
 
-        w_before = nearest_word(words, b, True) if b else None
-        w_after = nearest_word(words, b, False) if b else None
+    for r in bad_regions:
+        b_before = nearest_before(breaths, r["start"])
+        b_after = nearest_after(breaths, r["start"])
+
+        if b_before is None and b_after is None:
+            advice = "No clear breath nearby — consider adding a reset before this phrase."
+            relation = None
+            breath_time = None
+
+        elif b_before is None:
+            advice = "You entered this phrase without a prep breath. Try breathing earlier."
+            relation = "after"
+            breath_time = b_after
+
+        elif (r["start"] - b_before) > 2.0:
+            advice = "This phrase was long after your last breath. Take a breath closer before it."
+            relation = "before"
+            breath_time = b_before
+
+        else:
+            advice = "Try releasing earlier or lowering intensity near the end of this phrase."
+            relation = "before"
+            breath_time = b_before
+
+        coaching = (
+            f"[{r['label'].upper()}] {r['start']:.2f}–{r['end']:.2f}s | "
+            f"{advice}"
+        )
 
         assignments.append({
             "label": r["label"],
             "region": r,
-            "breath_time": b,
-            "relation": relation if b else None,
-            "word_anchor": {
-                "before": w_before,
-                "after": w_after,
-            },
+            "breath_time": breath_time,
+            "relation": relation,
+            "coaching": coaching,
         })
 
-    coaching_lines = []
-    for a in assignments:
-        r = a["region"]
-        w = a["word_anchor"]["before"]
-        word_txt = (
-            f"near '{w['word']}' ({w['start']:.2f}s)"
-            if w else "near phrase boundary"
-        )
-
-        coaching_lines.append(
-            f"[{r['label'].upper()}] {r['start']:.2f}–{r['end']:.2f}s | "
-            f"breath {a['relation']} {word_txt}. {r['note']}"
-        )
+        coaching_lines.append(coaching)
 
     result = {
         "input": input_media_path,
         "audio_used": audio_path,
         "breaths": breaths,
         "bad_regions": bad_regions,
-        "words": words,
         "assignments": assignments,
         "coaching_lines": coaching_lines,
+        "disclaimer": "Timing-based coaching, not medical advice.",
     }
 
     os.makedirs(out_dir, exist_ok=True)
