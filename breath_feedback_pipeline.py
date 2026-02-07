@@ -1,375 +1,545 @@
 #!/usr/bin/env python3
 """
-breath_feedback_pipeline.py
+breath_coach_onefile.py
 
-Single-file pipeline that:
-1) Extracts audio from an input MP4 via ffmpeg
-2) Transcribes audio with word-level timestamps (WhisperX; free/local)
-3) Maps "inhale start" timestamps to nearby words
-4) Assigns bad regions (strain/collapse) to nearby breaths (usually breath before)
-5) Optionally calls an OpenAI LLM to generate human coaching lines
-6) Writes outputs to out_dir
+Single-file breath coaching integrator.
 
-USAGE (CLI testing):
-  python breath_feedback_pipeline.py \
-    --mp4 input.mp4 \
-    --breaths_json breaths.json \
-    --bad_json bad.json \
-    --out_dir out \
-    --do_llm
+Inputs:
+  - mp4/audio path
+  - breaths_dict: your pose/audio fusion output (uses inhalations[].t_start as breath start)
+  - bad_dict: detector output dict (mistakes.strain/collapse regions)
 
-Where:
-- breaths.json contains your big breath dict (with "inhalations": [{"t_start": ...}, ...])
-- bad.json contains:
-    {"strain":[{"start_s":..., "end_s":..., "peak":...}, ...],
-     "collapse":[{"start_s":..., "end_s":..., "peak":...}, ...]}
+Outputs (returned dict):
+  - extracted audio path used
+  - words with timestamps (if transcription succeeds)
+  - bad regions
+  - breath events (start only)
+  - assignments: bad region -> chosen breath (+ word anchors)
+  - coaching_lines (deterministic)
+  - llm_coaching (optional, if --llm and OPENAI_API_KEY is set)
 
-INSTALL:
-  pip install -U numpy
-  pip install -U whisperx
-  pip install -U openai   # only if using --do_llm
+Env vars:
+  - OPENAI_API_KEY: set to your key to enable LLM calls
+    (if missing, treated as "NotImplemented")
 
-SYSTEM:
-  ffmpeg must be installed and on PATH.
+CLI:
+  python breath_coach_onefile.py --input test.mp4 --bad_json bad.json --breaths_json breaths.json --out out --llm
 
-NOTES:
-- Breath durations are not trusted; we use inhale START times.
-- WhisperX provides word-level timestamps via alignment (free/local).
+Transcription:
+  Preferred: whisperx (word-level alignment)
+    pip install -U whisperx
+  Fallback: openai-whisper (segment timestamps; we approximate word timestamps if needed)
+    pip install -U openai-whisper
+
+ffmpeg:
+  mac: brew install ffmpeg
+  ubuntu: sudo apt-get install ffmpeg
+  windows: install ffmpeg and add to PATH
 """
 
+from __future__ import annotations
+
 import os
+import re
 import json
-import argparse
+import math
+import shutil
 import subprocess
-from typing import Dict, List, Any, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
 
-OPENAI_API_KEY = NotImplemented
+# ------------------------- Helpers -------------------------
 
-# ----------------------------
-# Audio extraction
-# ----------------------------
-def extract_audio_ffmpeg(mp4_path: str, wav_out: str, sr: int = 16000) -> str:
-    os.makedirs(os.path.dirname(wav_out), exist_ok=True)
+def _ensure_dir(p: str) -> None:
+    os.makedirs(p, exist_ok=True)
+
+def _is_video(path: str) -> bool:
+    ext = os.path.splitext(path)[1].lower()
+    return ext in {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
+
+def _run_ffmpeg_extract_audio(input_path: str, out_wav_path: str, sr: int = 16000) -> None:
+    """
+    Extract mono 16k wav for transcription. Overwrites out_wav_path.
+    """
     cmd = [
-        "ffmpeg", "-y", "-i", mp4_path,
-        "-vn", "-ac", "1", "-ar", str(sr),
-        "-f", "wav", wav_out
+        "ffmpeg", "-y",
+        "-i", input_path,
+        "-vn",
+        "-ac", "1",
+        "-ar", str(sr),
+        "-f", "wav",
+        out_wav_path
     ]
-    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return wav_out
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except FileNotFoundError:
+        raise RuntimeError("ffmpeg not found. Install ffmpeg and ensure it's on PATH.")
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"ffmpeg audio extraction failed: {e}")
 
-
-# ----------------------------
-# WhisperX transcription
-# ----------------------------
-def transcribe_words_whisperx(audio_path: str, device: str = "cpu", model_size: str = "small") -> List[Dict[str, float]]:
+def _pick_audio_path(input_path: str, out_dir: str, sr: int = 16000) -> str:
     """
-    Returns list of word dicts: [{"word": str, "start": float, "end": float}, ...]
+    If input is video, extract audio to out_dir/_extracted.wav.
+    If input is audio, return as-is (still may be re-encoded by ffmpeg if desired; here we keep it).
     """
-    import whisperx  # type: ignore
+    _ensure_dir(out_dir)
+    if _is_video(input_path):
+        out_wav = os.path.join(out_dir, "_extracted.wav")
+        _run_ffmpeg_extract_audio(input_path, out_wav, sr=sr)
+        return out_wav
+    else:
+        # Optionally you could still normalize/convert; keeping simple.
+        return input_path
 
-    model = whisperx.load_model(model_size, device=device)
-    result = model.transcribe(audio_path)
+def _safe_float(x: Any, default: float = float("nan")) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return default
 
-    align_model, metadata = whisperx.load_align_model(
-        language_code=result["language"], device=device
-    )
-    aligned = whisperx.align(result["segments"], align_model, metadata, audio_path, device=device)
+def _sort_by_key(items: List[dict], key: str) -> List[dict]:
+    return sorted(items, key=lambda d: _safe_float(d.get(key, float("inf"))))
 
-    words: List[Dict[str, float]] = []
-    for seg in aligned.get("segments", []):
-        for w in seg.get("words", []):
-            if w.get("start") is None or w.get("end") is None:
-                continue
-            words.append({"word": str(w["word"]), "start": float(w["start"]), "end": float(w["end"])})
-    return words
+# ------------------------- Breath + Mistakes -------------------------
 
+@dataclass
+class BreathEvent:
+    start: float
+    confidence: float = 1.0
+    source: str = "inhalations"
 
-# ----------------------------
-# Breath parsing
-# ----------------------------
-def breaths_from_pose_dict(breath_dict: Dict[str, Any]) -> List[Dict[str, Any]]:
+@dataclass
+class BadRegion:
+    label: str               # "strain" | "collapse"
+    start_s: float
+    end_s: float
+    peak: float
+    note: str
+
+def extract_breath_events(breaths_dict: Dict[str, Any]) -> List[BreathEvent]:
     """
-    Your reliable timestamps are inhalations[*].t_start.
-    We convert to a uniform list of breath events.
+    Your note: durations are unreliable, starts are reliable.
+    We treat each inhalations[].t_start as a breath event time.
     """
-    out: List[Dict[str, Any]] = []
-    inhalations = breath_dict.get("inhalations", []) or []
-    for inh in inhalations:
-        try:
-            t_start = float(inh["t_start"])
-        except Exception:
-            continue
-        t_end = float(inh.get("t_end", t_start))  # unreliable but included
-        out.append({
-            "start": t_start,
-            "end": t_end,
-            "confidence": float(inh.get("confidence", 0.5)) if "confidence" in inh else 0.5,
-            "sources": ["pose", "audio"],  # keep your existing convention
-        })
-    out.sort(key=lambda b: b["start"])
+    inh = breaths_dict.get("inhalations", []) or []
+    events: List[BreathEvent] = []
+    for it in inh:
+        t = _safe_float(it.get("t_start"))
+        if math.isfinite(t):
+            events.append(BreathEvent(start=t, confidence=1.0, source="inhalations"))
+    events.sort(key=lambda b: b.start)
+    return events
+
+def extract_bad_regions(bad_dict: Dict[str, Any]) -> List[BadRegion]:
+    mistakes = (bad_dict.get("mistakes") or {})
+    out: List[BadRegion] = []
+    for label in ("strain", "collapse"):
+        for r in (mistakes.get(label) or []):
+            out.append(
+                BadRegion(
+                    label=label,
+                    start_s=_safe_float(r.get("start_s")),
+                    end_s=_safe_float(r.get("end_s")),
+                    peak=_safe_float(r.get("peak")),
+                    note=str(r.get("note") or ""),
+                )
+            )
+    out.sort(key=lambda br: br.start_s)
     return out
 
+# ------------------------- Assignment: bad region -> breath -------------------------
 
-# ----------------------------
-# Word lookup helpers
-# ----------------------------
-def nearest_word_before(words: List[Dict[str, float]], t: float) -> Optional[Dict[str, float]]:
-    cand = [w for w in words if w["start"] <= t]
-    return max(cand, key=lambda w: w["start"]) if cand else None
+def _nearest_breath_before(breaths: List[BreathEvent], t: float) -> Optional[BreathEvent]:
+    before = [b for b in breaths if b.start <= t]
+    return max(before, key=lambda b: b.start) if before else None
 
-def nearest_word_after(words: List[Dict[str, float]], t: float) -> Optional[Dict[str, float]]:
-    cand = [w for w in words if w["start"] > t]
-    return min(cand, key=lambda w: w["start"]) if cand else None
+def _nearest_breath_after(breaths: List[BreathEvent], t: float) -> Optional[BreathEvent]:
+    after = [b for b in breaths if b.start > t]
+    return min(after, key=lambda b: b.start) if after else None
 
-def attach_words_to_breaths(
-    breaths: List[Dict[str, Any]],
-    words: List[Dict[str, float]],
-    max_gap_s: float = 2.0,
-) -> List[Dict[str, Any]]:
-    """
-    For each breath start, attach word_before/word_after if within max_gap_s.
-    """
-    for b in breaths:
-        t = float(b["start"])
-        w_prev = nearest_word_before(words, t)
-        w_next = nearest_word_after(words, t)
-
-        if w_prev and (t - float(w_prev["start"])) <= max_gap_s:
-            b["word_before"] = w_prev
-        else:
-            b["word_before"] = None
-
-        if w_next and (float(w_next["start"]) - t) <= max_gap_s:
-            b["word_after"] = w_next
-        else:
-            b["word_after"] = None
-
-    return breaths
-
-
-# ----------------------------
-# Assign bad regions -> breaths
-# ----------------------------
-def _breath_before(breaths: List[Dict[str, Any]], t: float) -> Optional[Dict[str, Any]]:
-    b = [x for x in breaths if float(x["start"]) <= t]
-    return max(b, key=lambda x: float(x["start"])) if b else None
-
-def _breath_after(breaths: List[Dict[str, Any]], t: float) -> Optional[Dict[str, Any]]:
-    b = [x for x in breaths if float(x["start"]) > t]
-    return min(b, key=lambda x: float(x["start"])) if b else None
-
-def assign_bad_to_breaths(
-    breaths: List[Dict[str, Any]],
-    bad: Dict[str, List[Dict[str, Any]]],
+def assign_regions_to_breaths(
+    regions: List[BadRegion],
+    breaths: List[BreathEvent],
     pre_window_s: float = 10.0,
     post_window_s: float = 3.0,
 ) -> List[Dict[str, Any]]:
     """
-    For each bad region, choose a breath before it if close enough,
-    else choose a breath after it if close enough.
+    For each bad region, choose a breath:
+      - Prefer closest breath BEFORE region start within pre_window_s
+      - Else closest breath AFTER within post_window_s
+      - Else whatever exists (before/after), or None
     """
-    assignments: List[Dict[str, Any]] = []
+    out: List[Dict[str, Any]] = []
+    for r in regions:
+        prev_b = _nearest_breath_before(breaths, r.start_s)
+        next_b = _nearest_breath_after(breaths, r.start_s)
 
-    for label in ("strain", "collapse"):
-        regions = bad.get(label, []) or []
-        for r in regions:
-            rs = float(r["start_s"])
-            re = float(r.get("end_s", rs))
-            peak = float(r.get("peak", 0.0))
+        chosen: Optional[BreathEvent] = None
+        relation: Optional[str] = None
 
-            prev_b = _breath_before(breaths, rs)
-            next_b = _breath_after(breaths, rs)
+        if prev_b and (r.start_s - prev_b.start) <= pre_window_s:
+            chosen = prev_b
+            relation = "before"
+        elif next_b and (next_b.start - r.start_s) <= post_window_s:
+            chosen = next_b
+            relation = "after"
+        else:
+            chosen = prev_b or next_b
+            relation = "before" if chosen is prev_b else ("after" if chosen is next_b else None)
 
-            chosen, rel = None, None
-            if prev_b is not None and (rs - float(prev_b["start"])) <= pre_window_s:
-                chosen, rel = prev_b, "before"
-            elif next_b is not None and (float(next_b["start"]) - rs) <= post_window_s:
-                chosen, rel = next_b, "after"
-            else:
-                chosen = prev_b or next_b
-                rel = "before" if chosen is prev_b else ("after" if chosen is next_b else None)
+        out.append({
+            "label": r.label,
+            "region": {
+                "start_s": r.start_s,
+                "end_s": r.end_s,
+                "peak": r.peak,
+                "note": r.note,
+            },
+            "breath": (None if chosen is None else {
+                "start": chosen.start,
+                "confidence": chosen.confidence,
+                "source": chosen.source,
+            }),
+            "breath_relation": relation
+        })
+    return out
 
-            assignments.append({
-                "label": label,
-                "region_start": rs,
-                "region_end": re,
-                "peak": peak,
-                "breath": chosen,
-                "breath_relation": rel,
-            })
+# ------------------------- Transcription (word timestamps) -------------------------
 
-    assignments.sort(key=lambda a: float(a["region_start"]))
+def transcribe_words(audio_path: str, device: str = "cpu") -> List[Dict[str, Any]]:
+    """
+    Returns list of words: [{"word": str, "start": float, "end": float}, ...]
+
+    Preferred: whisperx for aligned word timestamps.
+    Fallback: openai-whisper segments (no word timestamps) -> we approximate word times by
+              distributing words uniformly across the segment.
+
+    You can install:
+      pip install -U whisperx
+    or:
+      pip install -U openai-whisper
+    """
+    # Try WhisperX
+    try:
+        import whisperx  # type: ignore
+
+        model = whisperx.load_model("small", device=device)
+        result = model.transcribe(audio_path)
+
+        align_model, metadata = whisperx.load_align_model(language_code=result["language"], device=device)
+        aligned = whisperx.align(result["segments"], align_model, metadata, audio_path, device=device)
+
+        words: List[Dict[str, Any]] = []
+        for seg in aligned.get("segments", []):
+            for w in seg.get("words", []) or []:
+                if w.get("start") is None or w.get("end") is None:
+                    continue
+                token = str(w.get("word") or "").strip()
+                if token:
+                    words.append({"word": token, "start": float(w["start"]), "end": float(w["end"])})
+        return words
+
+    except ImportError:
+        pass
+    except Exception:
+        # If whisperx exists but fails, try fallback
+        pass
+
+    # Fallback: openai-whisper
+    try:
+        import whisper  # type: ignore
+    except ImportError:
+        raise RuntimeError(
+            "No transcription backend available. Install one:\n"
+            "  pip install -U whisperx\n"
+            "or\n"
+            "  pip install -U openai-whisper"
+        )
+
+    model = whisper.load_model("small")
+    res = model.transcribe(audio_path, fp16=False)
+    segments = res.get("segments", []) or []
+
+    words_out: List[Dict[str, Any]] = []
+    for seg in segments:
+        s0 = float(seg.get("start", 0.0))
+        s1 = float(seg.get("end", s0))
+        text = str(seg.get("text") or "").strip()
+        if not text:
+            continue
+        # crude word splitting
+        toks = [t for t in re.split(r"\s+", text) if t]
+        if not toks or s1 <= s0:
+            continue
+        dur = s1 - s0
+        step = dur / max(len(toks), 1)
+        for i, tok in enumerate(toks):
+            w0 = s0 + i * step
+            w1 = min(s1, w0 + step)
+            words_out.append({"word": tok, "start": w0, "end": w1})
+    return words_out
+
+def _nearest_word(words: List[Dict[str, Any]], t: float, direction: str = "before") -> Optional[Dict[str, Any]]:
+    if not words:
+        return None
+    if direction == "before":
+        cand = [w for w in words if float(w["start"]) <= t]
+        return max(cand, key=lambda w: float(w["start"])) if cand else None
+    else:
+        cand = [w for w in words if float(w["start"]) > t]
+        return min(cand, key=lambda w: float(w["start"])) if cand else None
+
+def attach_word_anchors(assignments: List[Dict[str, Any]], words: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    For each assignment (region -> breath), attach nearest word before/after the breath start.
+    """
+    for a in assignments:
+        breath = a.get("breath")
+        if not breath:
+            a["word_anchor"] = None
+            continue
+        bt = float(breath["start"])
+        w_before = _nearest_word(words, bt, "before")
+        w_after = _nearest_word(words, bt, "after")
+        a["word_anchor"] = {
+            "before": w_before,
+            "after": w_after
+        }
     return assignments
 
+# ------------------------- Deterministic coaching lines -------------------------
 
-# ----------------------------
-# Build structured alignment payload
-# ----------------------------
-def build_alignment_payload(
-    mp4_path: str,
-    audio_path: str,
-    breaths: List[Dict[str, Any]],
-    words: List[Dict[str, float]],
-    bad_assignments: List[Dict[str, Any]],
-) -> Dict[str, Any]:
-    enriched: List[Dict[str, Any]] = []
-    for a in bad_assignments:
-        b = a.get("breath", None)
-        if b is None:
-            enriched.append({**a, "breath_start": None, "anchor_word": None, "anchor_word_time": None})
-            continue
+def make_coaching_lines(assignments: List[Dict[str, Any]]) -> List[str]:
+    lines: List[str] = []
+    for a in assignments:
+        label = a["label"]
+        r = a["region"]
+        rs, re_, peak = float(r["start_s"]), float(r["end_s"]), float(r["peak"])
+        breath = a.get("breath")
+        rel = a.get("breath_relation")
 
-        breath_start = float(b["start"])
-        anchor = b.get("word_before") or b.get("word_after")
+        wa = a.get("word_anchor") or {}
+        w_before = (wa.get("before") or {}).get("word")
+        w_before_t = (wa.get("before") or {}).get("start")
+        w_after = (wa.get("after") or {}).get("word")
+        w_after_t = (wa.get("after") or {}).get("start")
 
-        enriched.append({
-            "label": a["label"],
-            "region_start": float(a["region_start"]),
-            "region_end": float(a["region_end"]),
-            "peak": float(a["peak"]),
-            "breath_relation": a.get("breath_relation"),
-            "breath_start": breath_start,
-            "anchor_word": (anchor["word"] if anchor else None),
-            "anchor_word_time": (float(anchor["start"]) if anchor else None),
-        })
+        if breath:
+            bt = float(breath["start"])
+            if w_before:
+                anchor = f"near '{w_before}' ({float(w_before_t):.2f}s)"
+            elif w_after:
+                anchor = f"near '{w_after}' ({float(w_after_t):.2f}s)"
+            else:
+                anchor = "near (no word anchor)"
 
-    return {
-        "mp4": mp4_path,
-        "audio": audio_path,
-        "breaths": breaths,  # includes word_before/word_after
-        "words_count": len(words),
-        "bad_assignments": enriched,
-    }
+            if label == "collapse":
+                lines.append(
+                    f"[COLLAPSE] {rs:.2f}-{re_:.2f}s peak={peak:.2f}. "
+                    f"Closest breath {rel} at {bt:.2f}s {anchor}. "
+                    f"Suggestion: plan a reset earlier (shorter phrase / breathe before the phrase end)."
+                )
+            else:
+                lines.append(
+                    f"[STRAIN] {rs:.2f}-{re_:.2f}s peak={peak:.2f}. "
+                    f"Closest breath {rel} at {bt:.2f}s {anchor}. "
+                    f"Suggestion: lighten onset, reduce push, and consider breathing sooner before this section."
+                )
+        else:
+            if label == "collapse":
+                lines.append(
+                    f"[COLLAPSE] {rs:.2f}-{re_:.2f}s peak={peak:.2f}. "
+                    f"No nearby breath detected. Suggest: earlier reset/breath before this phrase."
+                )
+            else:
+                lines.append(
+                    f"[STRAIN] {rs:.2f}-{re_:.2f}s peak={peak:.2f}. "
+                    f"No nearby breath detected. Suggest: reduce intensity and check support/relaxation."
+                )
+    return lines
 
+# ------------------------- Optional OpenAI LLM polishing -------------------------
 
-# ----------------------------
-# OpenAI LLM feedback (optional)
-# ----------------------------
-def llm_generate_feedback_openai(
-    alignment_payload: Dict[str, Any],
+def llm_polish_feedback(
+    transcript_words: List[Dict[str, Any]],
+    assignments: List[Dict[str, Any]],
+    deterministic_lines: List[str],
     model: str = "gpt-5.2",
 ) -> str:
     """
-    Requires: pip install -U openai and OPENAI_API_KEY env var.
+    Uses OpenAI Responses API to turn structured findings into natural coaching.
+
+    Requires:
+      pip install openai
+      export OPENAI_API_KEY=...
     """
-    from openai import OpenAI  # type: ignore
-    client = OpenAI()
+    api_key = os.getenv("OPENAI_API_KEY", "NotImplemented")
+    if not api_key or api_key == "NotImplemented":
+        raise RuntimeError("OPENAI_API_KEY not set. Set it or run without --llm.")
 
-    # Keep it focused: only the mapped events (top few already)
-    events = alignment_payload.get("bad_assignments", [])
+    try:
+        from openai import OpenAI  # type: ignore
+    except ImportError:
+        raise RuntimeError("OpenAI SDK not installed. Run: pip install openai")
 
-    prompt = {
-        "task": "Generate concise breath/coaching feedback for a singer.",
-        "rules": [
-            "Only comment on STRAIN and PHRASE COLLAPSE events.",
-            "Reference breath_start timestamp and anchor_word when available.",
-            "If anchor_word missing, reference only the timestamp.",
-            "Give actionable advice: where to breathe earlier/later, reset support, lighten onset, avoid pushing.",
-            "Return 3–8 bullet points max.",
-            "Do not invent words or timestamps beyond the provided data."
-            "If you are able to figure out which song it is, and are sure about which line after which breath, include that line.",
-            "If no bad events are present, respond with: 'No significant breath-related issues detected"
-        ],
-        "events": events
+    # Build a compact transcript preview (avoid dumping thousands of words)
+    # We include the first ~250 and last ~250 words with timestamps.
+    def _pack_words(words: List[Dict[str, Any]], max_words: int = 250) -> str:
+        if not words:
+            return ""
+        head = words[:max_words]
+        tail = words[-max_words:] if len(words) > max_words else []
+        def fmt(ws):
+            return " ".join([f"{w['word']}@{float(w['start']):.2f}" for w in ws])
+        if tail:
+            return fmt(head) + " ... " + fmt(tail)
+        return fmt(head)
+
+    transcript_preview = _pack_words(transcript_words, 200)
+
+    payload = {
+        "transcript_preview": transcript_preview,
+        "assignments": assignments,
+        "deterministic_lines": deterministic_lines,
+        "instructions": (
+            "You are a vocal coach. Produce 3–8 bullet points max.\n"
+            "Each bullet should mention:\n"
+            " - the problematic region time range\n"
+            " - the nearest breath time (and word if present)\n"
+            " - a concrete actionable suggestion: where to breathe, how to adjust intensity/support\n"
+            "Avoid medical claims. Keep it practical.\n"
+            "If you recognise the song, and knwo where the breath shoudl exactly be take, mention the line.\n"
+        ),
     }
 
+    client = OpenAI()
     resp = client.responses.create(
         model=model,
-        input=f"Here is structured event data (JSON). Write feedback:\n{json.dumps(prompt)}"
+        input=[
+            {"role": "system", "content": "Return only the bullet list. No preamble."},
+            {"role": "user", "content": json.dumps(payload)}
+        ],
     )
-    return resp.output_text
+    # SDK provides output_text convenience in docs; fallback if missing
+    txt = getattr(resp, "output_text", None)
+    if txt:
+        return txt
+    # generic extraction
+    try:
+        return resp.output[0].content[0].text  # type: ignore
+    except Exception:
+        return str(resp)
 
+# ------------------------- Main public function -------------------------
 
-# ----------------------------
-# Main high-level function (what your other file can call)
-# ----------------------------
-def run_breath_alignment_and_feedback(
-    mp4_path: str,
-    breath_dict: Dict[str, Any],
+def analyze_breaths_and_bad_regions(
+    input_media_path: str,
+    breaths_dict: Dict[str, Any],
     bad_dict: Dict[str, Any],
-    out_dir: str,
-    whisper_device: str = "cpu",
-    whisper_model_size: str = "small",
-    do_llm: bool = False,
+    out_dir: str = "out_breathcoach",
+    do_transcript: bool = True,
+    transcript_device: str = "cpu",
+    pre_window_s: float = 10.0,
+    post_window_s: float = 3.0,
+    use_llm: bool = False,
     llm_model: str = "gpt-5.2",
 ) -> Dict[str, Any]:
     """
-    This is the function you want to call from elsewhere, passing the two dicts.
+    Importable function.
+
+    Returns dict with:
+      - audio_used
+      - breaths (start times)
+      - bad_regions
+      - words (optional)
+      - assignments (+ word anchors if words present)
+      - coaching_lines
+      - llm_coaching (optional)
     """
-    os.makedirs(out_dir, exist_ok=True)
+    _ensure_dir(out_dir)
+    audio_used = _pick_audio_path(input_media_path, out_dir, sr=int(bad_dict.get("sample_rate", 16000) or 16000))
 
-    # 1) extract audio
-    audio_path = os.path.join(out_dir, "_extracted.wav")
-    extract_audio_ffmpeg(mp4_path, audio_path, sr=16000)
+    breaths = extract_breath_events(breaths_dict)
+    regions = extract_bad_regions(bad_dict)
 
-    # 2) breaths from dict
-    breaths = breaths_from_pose_dict(breath_dict)
+    assignments = assign_regions_to_breaths(regions, breaths, pre_window_s=pre_window_s, post_window_s=post_window_s)
 
-    # 3) transcript words
-    words = transcribe_words_whisperx(audio_path, device=whisper_device, model_size=whisper_model_size)
+    words: List[Dict[str, Any]] = []
+    if do_transcript:
+        words = transcribe_words(audio_used, device=transcript_device)
+        assignments = attach_word_anchors(assignments, words)
 
-    # 4) attach words to breath events
-    breaths = attach_words_to_breaths(breaths, words, max_gap_s=2.0)
+    coaching_lines = make_coaching_lines(assignments)
 
-    # 5) assign bad regions -> breaths
-    assignments = assign_bad_to_breaths(breaths, bad_dict, pre_window_s=10.0, post_window_s=3.0)
+    result: Dict[str, Any] = {
+        "input": input_media_path,
+        "audio_used": audio_used,
+        "breaths": [{"start": b.start, "confidence": b.confidence, "source": b.source} for b in breaths],
+        "bad_regions": [{"label": r.label, "start_s": r.start_s, "end_s": r.end_s, "peak": r.peak, "note": r.note} for r in regions],
+        "words": words if do_transcript else None,
+        "assignments": assignments,
+        "coaching_lines": coaching_lines,
+        "llm_coaching": None,
+    }
 
-    # 6) build alignment payload + save
-    alignment = build_alignment_payload(mp4_path, audio_path, breaths, words, assignments)
-    align_path = os.path.join(out_dir, "breath_bad_alignment.json")
-    with open(align_path, "w") as f:
-        json.dump(alignment, f, indent=2)
+    if use_llm:
+        try:
+            result["llm_coaching"] = llm_polish_feedback(words, assignments, coaching_lines, model=llm_model)
+        except Exception as e:
+            # Don't crash; return the deterministic output and surface the error
+            result["llm_coaching"] = f"[LLM disabled/error] {e}"
 
-    # 7) optional LLM feedback
-    feedback_text = None
-    if do_llm:
-        feedback_text = llm_generate_feedback_openai(alignment, model=llm_model)
-        with open(os.path.join(out_dir, "feedback.txt"), "w") as f:
-            f.write(feedback_text.strip() + "\n")
-        alignment["feedback_txt"] = os.path.join(out_dir, "feedback.txt")
+    # also persist a json artifact for debugging
+    with open(os.path.join(out_dir, "breath_coach_results.json"), "w") as f:
+        json.dump(result, f, indent=2)
 
-    alignment["alignment_json"] = align_path
-    return alignment
+    return result
 
+# ------------------------- CLI -------------------------
 
-# ----------------------------
-# CLI (for testing / running standalone)
-# ----------------------------
-def _load_json(path: str) -> Dict[str, Any]:
+def _load_json(path: str) -> dict:
     with open(path, "r") as f:
         return json.load(f)
 
 def main():
+    import argparse
+
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mp4", required=True, help="Path to input mp4/video")
-    ap.add_argument("--breaths_json", required=True, help="Path to breaths dict JSON (contains inhalations)")
-    ap.add_argument("--bad_json", required=True, help="Path to bad dict JSON (strain/collapse regions)")
-    ap.add_argument("--out_dir", default="out", help="Output directory")
-    ap.add_argument("--whisper_device", default="cpu", choices=["cpu", "cuda"], help="WhisperX device")
-    ap.add_argument("--whisper_model", default="small", help="Whisper model size: tiny/base/small/medium/large-v2 etc.")
-    ap.add_argument("--do_llm", action="store_true", help="Call OpenAI to generate feedback.txt")
-    ap.add_argument("--llm_model", default="gpt-5.2", help="OpenAI model name for feedback")
+    ap.add_argument("--input", required=True, help="mp4/audio input")
+    ap.add_argument("--breaths_json", required=True, help="json file containing breaths_dict format")
+    ap.add_argument("--bad_json", required=True, help="json file containing bad_dict format")
+    ap.add_argument("--out", default="out_breathcoach")
+    ap.add_argument("--no_transcript", action="store_true")
+    ap.add_argument("--device", default="cpu", help="transcription device: cpu/cuda")
+    ap.add_argument("--pre_window_s", type=float, default=10.0)
+    ap.add_argument("--post_window_s", type=float, default=3.0)
+    ap.add_argument("--llm", action="store_true", help="Use OpenAI to polish coaching (requires OPENAI_API_KEY)")
+    ap.add_argument("--llm_model", default="gpt-5.2")
     args = ap.parse_args()
 
-    breath_dict = _load_json(args.breaths_json)
+    breaths_dict = _load_json(args.breaths_json)
     bad_dict = _load_json(args.bad_json)
 
-    alignment = run_breath_alignment_and_feedback(
-        mp4_path=args.mp4,
-        breath_dict=breath_dict,
+    res = analyze_breaths_and_bad_regions(
+        input_media_path=args.input,
+        breaths_dict=breaths_dict,
         bad_dict=bad_dict,
-        out_dir=args.out_dir,
-        whisper_device=args.whisper_device,
-        whisper_model_size=args.whisper_model,
-        do_llm=args.do_llm,
+        out_dir=args.out,
+        do_transcript=not args.no_transcript,
+        transcript_device=args.device,
+        pre_window_s=args.pre_window_s,
+        post_window_s=args.post_window_s,
+        use_llm=args.llm,
         llm_model=args.llm_model,
     )
 
-    print("Wrote:", alignment["alignment_json"])
-    if args.do_llm and alignment.get("feedback_txt"):
-        print("Wrote:", alignment["feedback_txt"])
+    print("\nDeterministic coaching lines:")
+    for line in res["coaching_lines"]:
+        print(" -", line)
 
+    if args.llm:
+        print("\nLLM coaching:")
+        print(res["llm_coaching"])
 
 if __name__ == "__main__":
     main()
