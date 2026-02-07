@@ -1,0 +1,5 @@
+numpy>=1.23
+scipy>=1.10
+librosa>=0.10.1
+soundfile>=0.12.1
+matplotlib>=3.7
